@@ -54,10 +54,8 @@ ACC_tensorboard_ind = 0
 
 
 global device
-if torch.cuda.is_available():
-    device = 'cuda'
-else:
-    device = 'cpu'
+# remember, don't set device as a string, set it as a torch.device object
+device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
 
 
 def convert_list_to_dict(dict_raw_int,value):
@@ -196,59 +194,76 @@ def readFa(fa):
                 break
 
 
-def self_evaluate(model, test_train_iter, valid_tensorboard_ind, valid_writer):
-      for ind, (src, trg, mask) in enumerate(test_train_iter):
-            src = src.to(device)
-            trg = trg.to(device)
-            mask = mask.to(device)
-            zero_trg = trg.clone()
-            zero_trg[:,:]=0
-            seq_logits, annotation_logits = model(src, zero_trg, mask = mask) 
-            seq_logits = seq_logits[mask] 
+def self_evaluate(model, test_train_iter):
+    model.eval()  # Set model to evaluation mode
+    total_loss = 0
+    total_seq_loss = 0
+    total_annotation_loss = 0
+    num_batches = 0
+
+    with torch.no_grad():  # Disable gradient calculation for efficiency
+        for src, trg, mask in test_train_iter:
+            src, trg, mask = src.to(device), trg.to(device), mask.to(device)
+            zero_trg = torch.zeros_like(trg)  # Instead of trg.clone(), just create zeros
+            seq_logits, annotation_logits = model(src, zero_trg, mask=mask)
+
+            seq_logits = seq_logits[mask]
             seq_labels = src[mask]
             annotation_logits = annotation_logits[mask]
             annotation_labels = trg[mask]
-            valid_seq_loss = FC.cross_entropy(seq_logits, seq_labels, reduction = 'mean')
-            valid_annotation_loss = FC.cross_entropy(annotation_logits, annotation_labels, reduction = 'mean')
+
+            valid_seq_loss = F.cross_entropy(seq_logits, seq_labels, reduction='mean')
+            valid_annotation_loss = F.cross_entropy(annotation_logits, annotation_labels, reduction='mean')
             valid_loss = valid_seq_loss + valid_annotation_loss
 
-            valid_writer.add_scalar('valid_loss',valid_loss.item(),valid_tensorboard_ind)
-            valid_writer.add_scalar('valid_seq_loss',valid_seq_loss.item(),valid_tensorboard_ind)
-            valid_writer.add_scalar('valid_annotation_loss',valid_annotation_loss.item(),valid_tensorboard_ind)
-            valid_tensorboard_ind += 1
-      return valid_tensorboard_ind, valid_writer
+            total_loss += valid_loss.item()
+            total_seq_loss += valid_seq_loss.item()
+            total_annotation_loss += valid_annotation_loss.item()
+            num_batches += 1
+
+    # Compute average loss across all batches
+    avg_loss = total_loss / num_batches
+    avg_seq_loss = total_seq_loss / num_batches
+    avg_annotation_loss = total_annotation_loss / num_batches
+
+    # Log to wandb
+    # wandb.log({
+    #    "valid_loss": avg_loss,
+    #    "valid_seq_loss": avg_seq_loss,
+    #    "valid_annotation_loss": avg_annotation_loss
+    # })
+
+    return avg_loss, avg_seq_loss, avg_annotation_loss  # Returning only relevant evaluation metric
 
 
-def AA_acc(model, test_train_iter, ACC_tensorboard_ind, ACC_writer):
-    AA_acc_all = 0
-    for ind, (src, trg, mask) in enumerate(test_train_iter):
-        src = src.to(device)
-        trg = trg.to(device)
-        mask = mask.to(device)
-        zero_trg = trg.clone()
-        zero_trg[:,:]=0
-        seq_logits, annotation_logits = model(src, zero_trg, mask = mask) 
-        seq_logits = seq_logits[mask]
-        seq_labels = src[mask]
-        annotation_logits = annotation_logits[mask]
+def AA_acc(model, test_train_iter):
+    model.eval()  # Set model to evaluation mode
+    total_acc = 0
+    num_batches = 0
 
-        annotation_logits_array = np.array(annotation_logits.cpu().detach().numpy())
-        result_annotation = np.argmax(annotation_logits_array, axis=1)
-        DNA_annotation_result, AA_annotation_result = annotation_pre_to_AA(result_annotation)
-        AA_encode_annotation_result = AA_to_encode_AA(AA_annotation_result)
-        
-        same_number = 0
-        single_acc = 0
-        for idx in range(len(AA_encode_annotation_result)):
-            if seq_labels[idx] == AA_encode_annotation_result[idx]:
-                same_number = same_number + 1
-        single_acc = same_number/len(AA_encode_annotation_result)
-        AA_acc_all = AA_acc_all + single_acc
+    with torch.no_grad():  # No gradients needed for accuracy calculation
+        for src, trg, mask in test_train_iter:
+            src, trg, mask = src.to(device), trg.to(device), mask.to(device)
+            zero_trg = torch.zeros_like(trg)
+            seq_logits, annotation_logits = model(src, zero_trg, mask=mask)
 
-        ACC_writer.add_scalar('AA_acc',single_acc,ACC_tensorboard_ind)
-        ACC_tensorboard_ind += 1
+            seq_logits = seq_logits[mask]
+            seq_labels = src[mask]
+            annotation_logits = annotation_logits[mask]
 
-    return ACC_tensorboard_ind, ACC_writer
+            annotation_logits_array = annotation_logits.cpu().numpy()
+            result_annotation = np.argmax(annotation_logits_array, axis=1)
+            _, AA_annotation_result = annotation_pre_to_AA(result_annotation)
+            AA_encode_annotation_result = AA_to_encode_AA(AA_annotation_result)
+
+            same_number = sum(seq_labels[i] == AA_encode_annotation_result[i] for i in range(len(AA_encode_annotation_result)))
+            single_acc = same_number / len(AA_encode_annotation_result)
+            total_acc += single_acc
+            num_batches += 1
+
+    avg_acc = total_acc / num_batches
+
+    return avg_acc  # Returning only relevant accuracy metric
 
 
 
