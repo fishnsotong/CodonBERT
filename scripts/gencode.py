@@ -399,8 +399,8 @@ def fasta_to_dataframe(fasta_path: str) -> pd.DataFrame:
         pd.DataFrame: DataFrame with columns ['ensgid', 'DNA_seq'].
     """
     records = SeqIO.parse(fasta_path, "fasta")
-    data = [{"ensgid":  str(record.id).split("|")[0],
-             "enstid":  str(record.id).split("|")[1], 
+    data = [{"enstid":  str(record.id),
+            # "ensgid":  str(record.id).split("|")[0], "enstid":  str(record.id).split("|")[1], 
              "DNA_seq": str(record.seq)} for record in records]
 
     return pd.DataFrame(data)
@@ -414,8 +414,9 @@ def dataframe_to_fasta(df: pd.DataFrame, sequence_column: str, fasta_path: str) 
         sequence_column (str): Name of the column containing the primary sequence of the biomolecule.
         fasta_path (str): Path to save the FASTA file.
     """
-    records = [SeqRecord(Seq(row[sequence_column]), id=f"{row['ensgid']}|{row['enstid']}", description="") for _, row in df.iterrows()]
-    SeqIO.write(records, fasta_path, "fasta")
+    records = [SeqRecord(Seq(row[sequence_column]), id=row['enstid'], description="") for _, row in df.iterrows()]
+    # records = [SeqRecord(Seq(row[sequence_column]), id=f"{row['ensgid']}|{row['enstid']}", description="") for _, row in df.iterrows()]
+    SeqIO.write(records, fasta_path, "fasta-2line")
     logging.info(f"FASTA file saved as {fasta_path}")
 
 def run_cai(fasta_path: str, cfile: str = "Ehuman.cut") -> pd.DataFrame:
@@ -448,13 +449,13 @@ def run_cai(fasta_path: str, cfile: str = "Ehuman.cut") -> pd.DataFrame:
             for line in file:
                 parts = line.split()                             # splitting by whitespace
                 if len(parts) == 4 and parts[0] == "Sequence:":  # ensure correct format
-                    ensgid = parts[1]
+                    enstid = parts[1]
                     cai_value = float(parts[3])                  # extract CAI value
-                    cai_results[ensgid] = cai_value
+                    cai_results[enstid] = cai_value
 
         # convert to pandas Series and return a joined DataFrame
         cai_series = pd.Series(cai_results, name="CAI")
-        return df.join(cai_series, on="ensgid")
+        return df.join(cai_series, on="enstid")
     
     except subprocess.CalledProcessError as e:
         print(f"EMBOSS cai encountered an error for {fasta_path}: {e}")
@@ -468,6 +469,102 @@ def run_cai(fasta_path: str, cfile: str = "Ehuman.cut") -> pd.DataFrame:
         # clean up temporary files
         if os.path.exists(output_file):
             os.remove(output_file)
+
+def _run_cai(input_file, output_file, cfile: str = "Ehuman.cut"):
+        """Run EMBOSS CAI on a given input file and save results."""
+        try:
+            output = subprocess.run(
+                ["cai", "-seqall", input_file, "-cfile", cfile, "-outfile", output_file],
+                text=True,
+                capture_output=True,
+                check=True
+            )
+            print(output.stdout)  # Logging CAI output
+        except subprocess.CalledProcessError as e:
+            print(f"Error running CAI for {input_file}: {e}")
+
+def run_cai_multicore(fasta_path: str, cfile: str = "Ehuman.cut", num_processes: int = None) -> pd.DataFrame:
+    """
+    Calculate the Codon Adaptation Index (CAI) in parallel for a set of sequences.
+
+    Args:
+        fasta_path (str): Path to the FASTA file containing sequences.
+        cfile (str): Path to the codon frequency file.
+        num_processes (int, optional): Number of CPU cores to use. Defaults to all available cores.
+
+    Returns:
+        pd.DataFrame: DataFrame with columns ['ensgid', 'CAI'].
+    """
+
+    def split_fasta(input_fasta, num_splits):
+        """Split a FASTA file into smaller chunks for parallel processing."""
+        with open(input_fasta, "r") as f:
+            lines = f.readlines()
+
+        sequences = []
+        current_seq = []
+        for line in lines:
+            if line.startswith(">"):
+                if current_seq:
+                    sequences.append("".join(current_seq))
+                current_seq = [line]
+            else:
+                current_seq.append(line)
+        if current_seq:
+            sequences.append("".join(current_seq))
+
+        num_seqs = len(sequences)
+        chunk_size = max(1, num_seqs // num_splits)  # Ensure at least one sequence per chunk
+        chunk_files = []
+
+        for i in range(num_splits):
+            chunk_file = f"split_{i}.fasta"
+            chunk_files.append(chunk_file)
+            with open(chunk_file, "w") as f:
+                f.writelines(sequences[i * chunk_size : (i + 1) * chunk_size])
+
+        return chunk_files
+
+    def parse_cai_output(output_files):
+        """Parse multiple CAI output files into a pandas DataFrame."""
+        cai_results = {}
+
+        for file in output_files:
+            if not os.path.exists(file):
+                continue  # Skip missing files
+            with open(file, "r") as infile:
+                for line in infile:
+                    parts = line.split()
+                    if len(parts) == 4 and parts[0] == "Sequence:":  # Ensure correct format
+                        ensgid = parts[1]
+                        cai_value = float(parts[3])
+                        cai_results[ensgid] = cai_value
+
+        return pd.Series(cai_results, name="CAI")
+
+    # Determine number of processes to use
+    if num_processes is None:
+        num_processes = os.cpu_count()
+
+    # Split the FASTA file
+    chunk_files = split_fasta(fasta_path, num_processes)
+    output_files = [f"output_{i}.txt" for i in range(num_processes)]
+
+    # Run CAI in parallel
+    with multiprocessing.Pool(num_processes) as pool:
+        pool.starmap(_run_cai, zip(chunk_files, output_files))
+
+    # Parse output and join with the original FASTA dataframe
+    df = fasta_to_dataframe(fasta_path)
+    cai_series = parse_cai_output(output_files)
+    df = df.join(cai_series, on="ensgid")
+
+    # Cleanup temporary files
+    for file in chunk_files + output_files:
+        if os.path.exists(file):
+            os.remove(file)
+
+    return df
 
 def run_rnafold(sequence: str, name="sequence") -> float:
     """
@@ -520,7 +617,7 @@ def parallel_mfe(df: pd.DataFrame, threads: int = 4) -> pd.DataFrame:
     """
     if threads == 1:
         # using .apply() instead of ThreadPoolExecutor to avoid unnecessary overhead
-        df["MFE"] = df.apply(lambda row: run_rnafold(row.DNA_seq, name=row.ensgid), axis=1)
+        df["MFE"] = df.apply(lambda row: run_rnafold(row.DNA_seq, name=row.enstid), axis=1)
         return df
     
     else:
@@ -528,7 +625,7 @@ def parallel_mfe(df: pd.DataFrame, threads: int = 4) -> pd.DataFrame:
         with ThreadPoolExecutor(max_workers=threads) as executor:
         
             results = list(tqdm(
-                executor.map(lambda row: run_rnafold(row.DNA_seq, name=row.ensgid), df.itertuples(index=False)),
+                executor.map(lambda row: run_rnafold(row.DNA_seq, name=row.enstid), df.itertuples(index=False)),
                 total=len(df)
                 ))
     
@@ -556,16 +653,16 @@ if __name__ == '__main__':
     logging.info(f"Found {len(df):,} transcripts matching length criteria")
 
     # (d) calculate CAI and MFE, include only transcripts that fall within the criteria 
-    threads = min(multiprocessing.cpu_count(), 16)
+    threads = min(multiprocessing.cpu_count(), 64)
     dataframe_to_fasta(df, 'DNA_seq', 'data/filtered_transcripts.fa')
 
-    cai_df = run_cai(fasta_path="outputs/predictions.fasta")
+    cai_df = run_cai(fasta_path="data/filtered_transcripts.fa")
+    # cai_df = run_cai_multicore(fasta_path="data/filtered_transcripts.fa", num_processes=threads) BUG: doesn't save values properly!
     mfe_df = parallel_mfe(cai_df, threads=threads)
-    mfe_df.to_csv("outputs/mfe_cai.tsv", sep="\t", index=False)
+    mfe_df.to_csv("data/mfe_cai.tsv", sep="\t", index=False)
 
-    final_df = df[(df['CAI'] >= 0.7) & (df['MFE'] <= -200)]
+    final_df = mfe_df[(mfe_df['CAI'] >= 0.7) & (mfe_df['MFE'] <= -200)]
+    final_df.to_csv("data/train_data.tsv", sep="\t", index=False)
 
     # (3) SAVE
     
-
-
